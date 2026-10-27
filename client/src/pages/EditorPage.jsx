@@ -103,6 +103,9 @@ function EditorPage() {
 
   const [output, setOutput] = useState("");
   const [isRunning, setIsRunning] = useState(false);
+  // Synchronous guard: React state updates are async, so two clicks in the
+  // same tick could both pass the `isRunning` check and fire duplicate runs.
+  const isRunningRef = useRef(false);
   const [filePrompt, setFilePrompt] = useState(null);
   const [filePromptValue, setFilePromptValue] = useState("");
   const [filePromptError, setFilePromptError] = useState("");
@@ -849,8 +852,9 @@ function EditorPage() {
   };
   const runCode = async () => {
 
-    if (isRunning) return;
+    if (isRunningRef.current) return;
 
+    isRunningRef.current = true;
     setIsRunning(true);
 
     try {
@@ -898,6 +902,7 @@ function EditorPage() {
 
     } finally {
 
+      isRunningRef.current = false;
       setIsRunning(false);
     }
   };

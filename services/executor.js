@@ -34,6 +34,7 @@ const clampInt = (value, fallback, min, max) => {
 const COMPILE_TIMEOUT_MS = clampInt(process.env.COMPILE_TIMEOUT_MS, 60000, 1000, 300000);
 const EXECUTION_TIMEOUT_MS = clampInt(process.env.EXECUTION_TIMEOUT_MS, 15000, 1000, 120000);
 const MAX_OUTPUT_BYTES = 1024 * 1024; // 1 MB per stream
+const KILL_GRACE_MS = 5000; // force-resolve bound after a kill
 
 const GO_BIN = process.env.GO_BIN || "C:\\Program Files\\Go\\bin\\go.exe";
 const PHP_BIN = process.env.PHP_BIN || "C:\\Cphp\\php.exe";
@@ -76,17 +77,40 @@ const buildChildEnv = () => {
   return env;
 };
 
-const killTree = (pid) => {
-  if (!pid) return;
-  try {
-    // Kill the whole process tree (shell-less spawn still creates compiler
-    // grandchildren such as cc1plus/javac helper processes).
-    spawn("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
-  } catch { /* best effort */ }
-  try {
-    process.kill(pid);
-  } catch { /* already dead */ }
-};
+// Kill the whole process tree ATOMICALLY: taskkill /T enumerates from the
+// root, so it must finish BEFORE any direct kill of the root — killing the
+// root first races taskkill, its grandchildren escape (the JVM on this
+// machine spawns child processes) holding the stdio pipes, `close` never
+// fires and the HTTP request hangs forever.
+const killTree = (pid) =>
+  new Promise((resolve) => {
+    if (!pid) {
+      resolve();
+      return;
+    }
+    let done = false;
+    const finishKill = () => {
+      if (done) return;
+      done = true;
+      resolve();
+    };
+    try {
+      const killer = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore",
+      });
+      killer.on("error", finishKill);
+      killer.on("close", finishKill);
+      setTimeout(finishKill, 3000); // never wait on taskkill itself
+    } catch {
+      finishKill();
+    }
+  }).then(() => {
+    // Direct fallback only after the tree kill had its chance.
+    try {
+      process.kill(pid);
+    } catch { /* already dead */ }
+  });
 
 /**
  * Run one process phase (compile or execute) with a hard timeout.
@@ -110,10 +134,13 @@ const runProcess = ({ command, args, cwd, timeoutMs, stdinData }) =>
       stdio: ["pipe", "pipe", "pipe"],
     });
 
+    let graceTimer = null;
+
     const finish = (extra) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (graceTimer) clearTimeout(graceTimer);
       resolve({
         timedOut,
         overflowed,
@@ -124,9 +151,21 @@ const runProcess = ({ command, args, cwd, timeoutMs, stdinData }) =>
       });
     };
 
+    // After a kill is issued, bound the wait: if an escaped grandchild keeps
+    // the stdio pipes open, `close` never fires — force-resolve instead of
+    // hanging the HTTP request forever.
+    const killAndBound = () => {
+      killTree(child.pid);
+      if (!graceTimer) {
+        graceTimer = setTimeout(() => {
+          finish({ exitCode: null, signal: null, forced: true });
+        }, KILL_GRACE_MS);
+      }
+    };
+
     const timer = setTimeout(() => {
       timedOut = true;
-      killTree(child.pid);
+      killAndBound();
     }, timeoutMs);
 
     child.stdout.on("data", (chunk) => {
@@ -135,7 +174,7 @@ const runProcess = ({ command, args, cwd, timeoutMs, stdinData }) =>
         stdout += chunk.toString();
       } else if (!overflowed) {
         overflowed = true;
-        killTree(child.pid); // stop a program that floods stdout
+        killAndBound(); // stop a program that floods stdout
       }
     });
 
@@ -145,7 +184,7 @@ const runProcess = ({ command, args, cwd, timeoutMs, stdinData }) =>
         stderr += chunk.toString();
       } else if (!overflowed) {
         overflowed = true;
-        killTree(child.pid);
+        killAndBound();
       }
     });
 

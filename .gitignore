@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Secrets & local config — never commit
+.env
+.env.*
+!.env.example
+.vscode/
+
+# Build output
+client/dist/
+
+# Logs
+*.log
+
+# Code-execution artifacts (POST /run writes these to the project folder on
+# older runs; the executor now uses the system temp directory)
+*.class
+*.exe
+????????-????-????-????-????????????????.*
+*_java/

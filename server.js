@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const { spawn } = require("child_process");
 require("dotenv").config();
 const express = require("express");
 const http = require("http");
@@ -23,10 +24,89 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 app.use(express.json());
+
+/* ---------------- HEALTH CHECK ---------------- */
+
+// Lightweight probe for hosting health checks (no auth, no secrets).
+// `runtimes` reports which compilers/interpreters this host can actually
+// spawn, so a production deployment can verify language support directly.
+let runtimeProbeCache = null;
+
+const probeRuntime = (command, args) =>
+  new Promise((resolve) => {
+    const probe = spawn(command, args, {
+      windowsHide: true,
+      stdio: "ignore",
+    });
+    const done = (available) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(available);
+    };
+    let settled = false;
+    const timer = setTimeout(() => {
+      try {
+        probe.kill();
+      } catch { /* already gone */ }
+      done(false);
+    }, 3000);
+    probe.on("error", () => done(false));
+    probe.on("close", (code) => done(code === 0));
+  });
+
+const probeRuntimes = async () => {
+  if (runtimeProbeCache) return runtimeProbeCache;
+
+  const { SUPPORTED_LANGUAGES } = require("./services/executor");
+
+  const checks = [
+    ["javascript", process.execPath, ["--version"]],
+    ["python", process.env.PYTHON_BIN || (process.platform === "win32" ? "python" : "python3"), ["--version"]],
+    ["cpp", "g++", ["--version"]],
+    ["java", "javac", ["-version"]],
+    ["go", process.env.GO_BIN || (process.platform === "win32" ? "C:\\Program Files\\Go\\bin\\go.exe" : "go"), ["version"]],
+    ["php", process.env.PHP_BIN || (process.platform === "win32" ? "C:\\Cphp\\php.exe" : "php"), ["--version"]],
+  ];
+
+  const results = {};
+  await Promise.all(
+    checks.map(async ([language, command, args]) => {
+      results[language] =
+        SUPPORTED_LANGUAGES.includes(language) && (await probeRuntime(command, args));
+    })
+  );
+
+  runtimeProbeCache = results;
+  return results;
+};
+
+app.get("/health", async (req, res) => {
+  const readyStates = ["disconnected", "connected", "connecting", "disconnecting"];
+  const mongodb = readyStates[mongoose.connection.readyState] || "unknown";
+  const runtimes = await probeRuntimes();
+
+  res.status(mongodb === "connected" ? 200 : 503).json({
+    status: mongodb === "connected" ? "ok" : "degraded",
+    uptimeSeconds: Math.round(process.uptime()),
+    mongodb,
+    codeExecution: executionEnabled ? "enabled" : "disabled",
+    runtimes,
+  });
+});
+
 app.use("/project", authenticateRequest, require("./routes/projectRoutes"));
 app.use("/api/auth", authRoutes);
 
 /* ---------------- MONGODB ---------------- */
+
+if (!process.env.MONGO_URI) {
+  // Fail fast with an actionable message instead of a cryptic mongoose error.
+  console.error(
+    "[Startup] MONGO_URI is not set. Add it to the environment (host dashboard or .env) and restart."
+  );
+  process.exit(1);
+}
 
 mongoose
   .connect(process.env.MONGO_URI)
@@ -34,8 +114,20 @@ mongoose
     console.log("MongoDB Connected");
   })
   .catch((error) => {
-    console.log(error);
+    // Keep the process alive: the driver keeps retrying in the background
+    // (transient Atlas network drops recover on their own). /health reports
+    // 503 while the database is unreachable.
+    console.error(
+      `[MongoDB] Initial connect failed: ${error.message}. The driver will keep retrying.`,
+    );
   });
+
+mongoose.connection.on("disconnected", () => {
+  console.warn("[MongoDB] Disconnected — reconnecting automatically.");
+});
+mongoose.connection.on("reconnected", () => {
+  console.log("[MongoDB] Reconnected.");
+});
 
 /* ---------------- CODEPILOT AI SERVICE ---------------- */
 
@@ -356,9 +448,30 @@ io.on("connection", (socket) => {
 
 const { executeProgram, SUPPORTED_LANGUAGES } = require("./services/executor");
 
+// Submitted code runs as a local child process with timeouts, an allowlisted
+// environment and a per-run temp directory — but WITHOUT OS-level sandbox
+// isolation. It is therefore disabled by default in production and must be
+// opted into explicitly (ENABLE_CODE_EXECUTION=true) only on a host where
+// that risk is acceptable (e.g. a locked-down container).
+const executionEnabled =
+  process.env.ENABLE_CODE_EXECUTION === "true" ||
+  process.env.NODE_ENV !== "production";
+
 app.post("/run", authenticateRequest, async (req, res) => {
 
   try {
+
+    if (!executionEnabled) {
+      return res.status(503).json({
+        output:
+          "Code execution is disabled on this deployment because it runs submitted code without OS-level sandbox isolation. Set ENABLE_CODE_EXECUTION=true only after arranging an isolated execution environment.",
+        status: "execution_disabled",
+        stdout: "",
+        stderr: "",
+        exitCode: null,
+        timedOut: false,
+      });
+    }
 
     const { code, language, input } = req.body;
 
@@ -451,17 +564,17 @@ app.post("/ai", authenticateRequest, async (req, res) => {
 
 /* ---------------- START SERVER ---------------- */
 
+const PORT = Number(process.env.PORT) || 5000;
+
 server.on("error", (error) => {
   if (error.code === "EADDRINUSE") {
-    console.error("Port 5000 is already in use. Stop the existing server before starting another one.");
+    console.error(`Port ${PORT} is already in use. Stop the existing server before starting another one.`);
     return;
   }
 
   console.error("Server failed to start:", error.message);
 });
 
-server.listen(5000, () => {
-  console.log(
-    "Server running on port 5000"
-  );
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });

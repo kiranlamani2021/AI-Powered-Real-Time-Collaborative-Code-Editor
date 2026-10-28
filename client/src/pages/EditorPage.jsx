@@ -14,6 +14,7 @@ import JSZip from "jszip";
 import { saveAs } from "file-saver";
 import Peer from "simple-peer";
 import CodePilotMessage from "../components/CodePilotMessage";
+import API_URL from "../api";
 
 const authConfig = () => ({
   headers: {
@@ -22,7 +23,7 @@ const authConfig = () => ({
 });
 
 const socket = io(
-  "http://localhost:5000",
+  API_URL,
   {
     transports: ["websocket"],
     auth: {
@@ -450,7 +451,7 @@ function EditorPage() {
 
           const response =
             await axios.get(
-              `http://localhost:5000/project/load/${roomId}`,
+              `${API_URL}/project/load/${roomId}`,
               authConfig()
             );
 
@@ -872,7 +873,7 @@ function EditorPage() {
     try {
 
       const response = await axios.post(
-        "http://localhost:5000/run",
+        `${API_URL}/run`,
         {
           roomId,
           code: files[activeFile],
@@ -908,7 +909,7 @@ function EditorPage() {
       } else {
 
         setOutput(
-          "Could not reach the code execution server at http://localhost:5000. Please make sure the backend is running."
+          `Could not reach the code execution server at ${API_URL}. Please make sure the backend is running.`
         );
       }
 
@@ -1117,7 +1118,7 @@ function EditorPage() {
     try {
 
       await axios.post(
-        "http://localhost:5000/project/save",
+        `${API_URL}/project/save`,
         {
           roomId,
           files,
@@ -1223,7 +1224,7 @@ function EditorPage() {
       console.log("📡 Sending request to backend...");
 
       const response = await axios.post(
-        "http://localhost:5000/ai",
+        `${API_URL}/ai`,
         {
   prompt: promptText,
   code: currentCode,

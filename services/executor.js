@@ -36,8 +36,17 @@ const EXECUTION_TIMEOUT_MS = clampInt(process.env.EXECUTION_TIMEOUT_MS, 15000, 1
 const MAX_OUTPUT_BYTES = 1024 * 1024; // 1 MB per stream
 const KILL_GRACE_MS = 5000; // force-resolve bound after a kill
 
-const GO_BIN = process.env.GO_BIN || "C:\\Program Files\\Go\\bin\\go.exe";
-const PHP_BIN = process.env.PHP_BIN || "C:\\Cphp\\php.exe";
+// Platform-aware defaults: the original Windows paths are kept on Windows;
+// other hosts resolve these from PATH (override with GO_BIN / PHP_BIN /
+// PYTHON_BIN).
+const IS_WINDOWS = process.platform === "win32";
+const GO_BIN =
+  process.env.GO_BIN ||
+  (IS_WINDOWS ? "C:\\Program Files\\Go\\bin\\go.exe" : "go");
+const PHP_BIN =
+  process.env.PHP_BIN || (IS_WINDOWS ? "C:\\Cphp\\php.exe" : "php");
+const PYTHON_BIN =
+  process.env.PYTHON_BIN || (IS_WINDOWS ? "python" : "python3");
 
 const SUPPORTED_LANGUAGES = ["javascript", "python", "cpp", "java", "go", "php"];
 
@@ -77,11 +86,13 @@ const buildChildEnv = () => {
   return env;
 };
 
-// Kill the whole process tree ATOMICALLY: taskkill /T enumerates from the
-// root, so it must finish BEFORE any direct kill of the root — killing the
-// root first races taskkill, its grandchildren escape (the JVM on this
-// machine spawns child processes) holding the stdio pipes, `close` never
-// fires and the HTTP request hangs forever.
+// Kill the whole process tree ATOMICALLY.
+// Windows: taskkill /T enumerates from the root, so it must finish BEFORE any
+// direct kill of the root — killing the root first races taskkill, its
+// grandchildren escape (the JVM spawns child processes) holding the stdio
+// pipes, `close` never fires and the HTTP request hangs forever.
+// POSIX: children are spawned detached (their own process group), so
+// kill(-pid) terminates the whole tree at once.
 const killTree = (pid) =>
   new Promise((resolve) => {
     if (!pid) {
@@ -95,13 +106,24 @@ const killTree = (pid) =>
       resolve();
     };
     try {
-      const killer = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
-        windowsHide: true,
-        stdio: "ignore",
-      });
-      killer.on("error", finishKill);
-      killer.on("close", finishKill);
-      setTimeout(finishKill, 3000); // never wait on taskkill itself
+      if (IS_WINDOWS) {
+        const killer = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
+          windowsHide: true,
+          stdio: "ignore",
+        });
+        killer.on("error", finishKill);
+        killer.on("close", finishKill);
+        setTimeout(finishKill, 3000); // never wait on taskkill itself
+      } else {
+        try {
+          process.kill(-pid, "SIGKILL"); // whole process group
+        } catch {
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch { /* already dead */ }
+        }
+        finishKill();
+      }
     } catch {
       finishKill();
     }
@@ -131,6 +153,9 @@ const runProcess = ({ command, args, cwd, timeoutMs, stdinData }) =>
       cwd,
       env: buildChildEnv(),
       windowsHide: true,
+      // On POSIX give every run its own process group so killTree can
+      // terminate the whole tree with kill(-pid).
+      detached: !IS_WINDOWS,
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -258,7 +283,7 @@ const executeProgram = async ({ language, code, input }) => {
     } else if (language === "python") {
       const file = path.join(runDir, `${id}.py`);
       fs.writeFileSync(file, code);
-      runPhase = { command: "python", args: [file] };
+      runPhase = { command: PYTHON_BIN, args: [file] };
     } else if (language === "cpp") {
       const file = path.join(runDir, `${id}.cpp`);
       const exe = path.join(runDir, `${id}.exe`);

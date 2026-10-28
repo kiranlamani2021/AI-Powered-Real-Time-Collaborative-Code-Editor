@@ -440,6 +440,8 @@ function EditorPage() {
 
     const loadProject = async () => {
 
+      let lastStatus = null;
+
       for (let attempt = 0; attempt < 3; attempt += 1) {
 
         if (!isCurrentRun()) return;
@@ -460,6 +462,7 @@ function EditorPage() {
           if (!isCurrentRun()) return;
 
           const status = error?.response?.status;
+          lastStatus = status ?? null;
           console.log("[Project Load Failed]", status || error?.message || error);
 
           // Access/permission problems will not fix themselves — stop retrying.
@@ -474,8 +477,17 @@ function EditorPage() {
       // Load never succeeded: refuse to autosave, otherwise the default
       // "main.js" state would overwrite the real saved project.
       setProjectLoadState("failed");
+      // The message must match the actual failure — telling a user whose
+      // session expired or who lacks access to "check the backend connection"
+      // sent them chasing a bug that does not exist.
       setLoadError(
-        "Could not load the saved project. Saving is disabled to protect your data — check the backend connection and reload the page."
+        lastStatus === 401
+          ? "Your session is missing or has expired, so the saved project could not be loaded. Saving is disabled to protect your data — please log in again and reopen this room."
+          : lastStatus === 403
+            ? "This room's saved project belongs to another account and you don't have access to it. You can still edit and run code here, but loading and saving are disabled to protect that project — log in with the account that owns this room to continue."
+            : lastStatus === 400
+              ? "This room ID is not valid, so the saved project cannot be loaded."
+              : "Could not load the saved project. Saving is disabled to protect your data — check the backend connection and reload the page."
       );
     };
 
